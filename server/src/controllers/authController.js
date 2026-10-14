@@ -2,10 +2,18 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import User from "../models/User.js";
 
-
-
+// ==========================================
+// GET LOGGED-IN USER
+// ==========================================
 export async function getMe(req, res) {
   try {
+    if (!req.user?.id) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required",
+      });
+    }
+
     const user = await User.findById(req.user.id).select(
       "-passwordHash"
     );
@@ -26,7 +34,7 @@ export async function getMe(req, res) {
       },
     });
   } catch (error) {
-    console.error("Get me error:", error);
+    console.error("Get me error:", error.message);
 
     return res.status(500).json({
       success: false,
@@ -35,17 +43,23 @@ export async function getMe(req, res) {
   }
 }
 
-
+// ==========================================
+// LOGOUT
+// ==========================================
 export async function logout(req, res) {
   try {
-    res.clearCookie("token");
+    res.clearCookie("token", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    });
 
     return res.status(200).json({
       success: true,
       message: "Logout successful",
     });
   } catch (error) {
-    console.error("Logout error:", error);
+    console.error("Logout error:", error.message);
 
     return res.status(500).json({
       success: false,
@@ -54,21 +68,41 @@ export async function logout(req, res) {
   }
 }
 
-
-
+// ==========================================
+// REGISTER
+// ==========================================
 export async function register(req, res) {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password } = req.body ?? {};
 
-    if (!name || !email || !password) {
+    // Validate input
+    if (
+      typeof name !== "string" ||
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !name.trim() ||
+      !email.trim() ||
+      !password
+    ) {
       return res.status(400).json({
         success: false,
         message: "Name, email and password are required",
       });
     }
 
+    const normalizedName = name.trim();
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must contain at least 8 characters",
+      });
+    }
+
+    // Check existing user
     const existingUser = await User.findOne({
-      email: email.toLowerCase(),
+      email: normalizedEmail,
     });
 
     if (existingUser) {
@@ -78,11 +112,12 @@ export async function register(req, res) {
       });
     }
 
+    // Hash password before saving
     const passwordHash = await bcrypt.hash(password, 10);
 
     const user = await User.create({
-      name,
-      email: email.toLowerCase(),
+      name: normalizedName,
+      email: normalizedEmail,
       passwordHash,
     });
 
@@ -96,7 +131,15 @@ export async function register(req, res) {
       },
     });
   } catch (error) {
-    console.error("Register error:", error);
+    // Handle duplicate email if simultaneous requests occur
+    if (error.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message: "User with this email already exists",
+      });
+    }
+
+    console.error("Register error:", error.message);
 
     return res.status(500).json({
       success: false,
@@ -105,19 +148,31 @@ export async function register(req, res) {
   }
 }
 
+// ==========================================
+// LOGIN
+// ==========================================
 export async function login(req, res) {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body ?? {};
 
-    if (!email || !password) {
+    // Validate input
+    if (
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !email.trim() ||
+      !password
+    ) {
       return res.status(400).json({
         success: false,
         message: "Email and password are required",
       });
     }
 
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // Find user in database
     const user = await User.findOne({
-      email: email.toLowerCase(),
+      email: normalizedEmail,
     });
 
     if (!user) {
@@ -127,6 +182,24 @@ export async function login(req, res) {
       });
     }
 
+    // Ensure password hash exists
+    if (
+      typeof user.passwordHash !== "string" ||
+      !user.passwordHash
+    ) {
+      console.error(
+        "Login failed: password hash missing for user ID:",
+        user._id.toString()
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "This account cannot be authenticated. Please register again with a new email or contact support.",
+      });
+    }
+
+    // Compare entered password with stored hash
     const isPasswordCorrect = await bcrypt.compare(
       password,
       user.passwordHash
@@ -139,18 +212,33 @@ export async function login(req, res) {
       });
     }
 
-    const token = jwt.sign(
-  { id: user._id },
-  process.env.JWT_SECRET,
-  { expiresIn: "7d" }
-);
+    // Verify JWT configuration
+    if (!process.env.JWT_SECRET) {
+      console.error("Login failed: JWT_SECRET is not configured");
 
-res.cookie("token", token, {
-  httpOnly: true,
-  secure: false,
-  sameSite: "lax",
-  maxAge: 7 * 24 * 60 * 60 * 1000,
-});
+      return res.status(500).json({
+        success: false,
+        message: "Server authentication configuration error",
+      });
+    }
+
+    // Create JWT
+    const token = jwt.sign(
+      { id: user._id.toString() },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    const isProduction = process.env.NODE_ENV === "production";
+
+    // Set authentication cookie
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: isProduction ? "none" : "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      path: "/",
+    });
 
     return res.status(200).json({
       success: true,
@@ -162,7 +250,7 @@ res.cookie("token", token, {
       },
     });
   } catch (error) {
-    console.error("Login error:", error);
+    console.error("Login error:", error.message);
 
     return res.status(500).json({
       success: false,
