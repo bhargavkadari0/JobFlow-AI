@@ -14,15 +14,17 @@ if (!apiKey) {
 
 const genAI = apiKey ? new GoogleGenerativeAI(apiKey) : null;
 
-const getGeminiModel = () => {
+const getGeminiModel = (
+  modelName = process.env.GEMINI_MODEL || "gemini-3.8-flash"
+) => {
   if (!genAI) {
     throw new Error(
-      "Gemini API key is missing. Check GEMINI_API_KEY in server/.env."
+      "Gemini API key is missing. Check GEMINI_API_KEY in the server environment."
     );
   }
 
   return genAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL || "gemini-3.8-flash",
+    model: modelName,
     generationConfig: {
       responseMimeType: "application/json",
       temperature: 0.4,
@@ -37,8 +39,7 @@ const getGeminiModel = () => {
 const delay = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-// Store the time until which Gemini requests should be blocked.
-// This prevents repeated requests after a known quota failure.
+// Prevent repeated requests after a known quota failure.
 let geminiQuotaBlockedUntil = 0;
 
 // Convert Google's retry information into milliseconds.
@@ -75,12 +76,11 @@ const getRetryDelayMs = (error, message = "") => {
     }
   }
 
-  // If Google does not provide a retry duration,
-  // temporarily stop repeated requests for one minute.
+  // Default cooldown: one minute.
   return 60_000;
 };
 
-// Create a clear error for exhausted Gemini quota.
+// Create a clear error when the Gemini quota is exhausted.
 const createQuotaError = (retryAfterMs) => {
   const seconds = Math.max(
     1,
@@ -121,156 +121,181 @@ const createQuotaError = (retryAfterMs) => {
 // =====================================================
 
 const generateJSON = async (prompt, maxRetries = 2) => {
-  // Stop immediately if a previous request established
-  // that the Gemini quota is exhausted.
+  // Stop immediately if the API quota is already known to be exhausted.
   if (geminiQuotaBlockedUntil > Date.now()) {
     throw createQuotaError(
       geminiQuotaBlockedUntil - Date.now()
     );
   }
 
-  const model = getGeminiModel();
+  // Primary and fallback models.
+  const primaryModel =
+    process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const result = await model.generateContent(prompt);
+  const fallbackModel =
+    process.env.GEMINI_FALLBACK_MODEL || "gemini-3.6-flash";
 
-      const responseText = result.response.text();
+  const modelsToTry = [
+    ...new Set([primaryModel, fallbackModel]),
+  ];
 
-      if (!responseText || !responseText.trim()) {
-        throw new Error("Gemini returned an empty response.");
-      }
+  let lastTemporaryError = null;
 
-      const cleaned = responseText
-        .replace(/^```json\s*/i, "")
-        .replace(/^```\s*/i, "")
-        .replace(/\s*```$/i, "")
-        .trim();
+  for (const modelName of modelsToTry) {
+    const model = getGeminiModel(modelName);
 
+    // maxRetries = 2 means up to three attempts per model.
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        return JSON.parse(cleaned);
-      } catch (parseError) {
-        console.error(
-          "Gemini returned invalid JSON:",
-          parseError.message
+        console.info(
+          `Requesting Gemini model: ${modelName}`
         );
 
-        const jsonError = new Error(
-          "Gemini returned an invalid JSON response. Please try again."
-        );
+        const result = await model.generateContent(prompt);
+        const responseText = result.response.text();
 
-        jsonError.code = "GEMINI_INVALID_JSON";
-
-        throw jsonError;
-      }
-    } catch (error) {
-      const status = Number(
-        error.status ??
-          error.statusCode ??
-          error.response?.status ??
-          0
-      );
-
-      const originalMessage = String(
-        error.message || "Unknown Gemini API error"
-      );
-
-      const message = originalMessage.toLowerCase();
-
-      const details = Array.isArray(error.errorDetails)
-        ? error.errorDetails
-        : [];
-
-      const hasQuotaFailure = details.some((detail) =>
-        String(detail?.["@type"] || "")
-          .toLowerCase()
-          .includes("quotafailure")
-      );
-
-      const isQuotaExceeded =
-        error.code === "GEMINI_QUOTA_EXCEEDED" ||
-        (
-          status === 429 &&
-          (
-            hasQuotaFailure ||
-            message.includes("quota exceeded") ||
-            message.includes("exceeded your current quota") ||
-            message.includes(
-              "generate_content_free_tier_requests"
-            ) ||
-            message.includes("resource_exhausted")
-          )
-        );
-
-      // Do not retry an already identified quota error.
-      if (error.code === "GEMINI_QUOTA_EXCEEDED") {
-        throw error;
-      }
-
-      console.error("Gemini API error details:", {
-        status: status || "Unknown",
-        message: originalMessage,
-        code: error.code || "Not provided",
-        errorDetails: error.errorDetails || null,
-      });
-
-      // Handle exhausted quota.
-      if (isQuotaExceeded) {
-        const retryAfterMs = getRetryDelayMs(
-          error,
-          originalMessage
-        );
-
-        geminiQuotaBlockedUntil =
-          Date.now() + retryAfterMs;
-
-        throw createQuotaError(retryAfterMs);
-      }
-
-      // Identify temporary errors.
-      const isTemporaryError =
-        [408, 429, 500, 502, 503, 504].includes(status) ||
-        message.includes("high demand") ||
-        message.includes("service unavailable") ||
-        message.includes("temporarily unavailable") ||
-        message.includes("too many requests") ||
-        message.includes("rate limit") ||
-        message.includes("overloaded");
-
-      // Do not retry permanent errors.
-      if (!isTemporaryError || attempt === maxRetries) {
-        if (isTemporaryError) {
-          const finalError = new Error(
-            "Gemini AI is temporarily busy. Please wait a moment and try again."
+        if (!responseText || !responseText.trim()) {
+          throw new Error(
+            "Gemini returned an empty response."
           );
-
-          finalError.status = status || 503;
-          finalError.code =
-            "GEMINI_TEMPORARILY_UNAVAILABLE";
-          finalError.originalMessage = originalMessage;
-
-          throw finalError;
         }
 
-        throw error;
+        // Remove Markdown code fences if present.
+        const cleaned = responseText
+          .replace(/^```json\s*/i, "")
+          .replace(/^```\s*/i, "")
+          .replace(/\s*```$/i, "")
+          .trim();
+
+        try {
+          return JSON.parse(cleaned);
+        } catch (parseError) {
+          console.error(
+            "Gemini returned invalid JSON:",
+            parseError.message
+          );
+
+          const jsonError = new Error(
+            "Gemini returned an invalid JSON response. Please try again."
+          );
+
+          jsonError.code = "GEMINI_INVALID_JSON";
+
+          throw jsonError;
+        }
+      } catch (error) {
+        const status = Number(
+          error.status ??
+            error.statusCode ??
+            error.response?.status ??
+            0
+        );
+
+        const originalMessage = String(
+          error.message || "Unknown Gemini API error"
+        );
+
+        const message = originalMessage.toLowerCase();
+
+        const details = Array.isArray(error.errorDetails)
+          ? error.errorDetails
+          : [];
+
+        const hasQuotaFailure = details.some((detail) =>
+          String(detail?.["@type"] || "")
+            .toLowerCase()
+            .includes("quotafailure")
+        );
+
+        const isQuotaExceeded =
+          error.code === "GEMINI_QUOTA_EXCEEDED" ||
+          (status === 429 &&
+            (hasQuotaFailure ||
+              message.includes("quota exceeded") ||
+              message.includes("exceeded your current quota") ||
+              message.includes(
+                "generate_content_free_tier_requests"
+              ) ||
+              message.includes("resource_exhausted")));
+
+        if (error.code === "GEMINI_QUOTA_EXCEEDED") {
+          throw error;
+        }
+
+        console.error("Gemini API error details:", {
+          model: modelName,
+          status: status || "Unknown",
+          message: originalMessage,
+          code: error.code || "Not provided",
+          errorDetails: error.errorDetails || null,
+        });
+
+        // Handle exhausted quota separately.
+        if (isQuotaExceeded) {
+          const retryAfterMs = getRetryDelayMs(
+            error,
+            originalMessage
+          );
+
+          geminiQuotaBlockedUntil =
+            Date.now() + retryAfterMs;
+
+          throw createQuotaError(retryAfterMs);
+        }
+
+        // Detect temporary errors.
+        const isTemporaryError =
+          [408, 429, 500, 502, 503, 504].includes(status) ||
+          message.includes("high demand") ||
+          message.includes("service unavailable") ||
+          message.includes("temporarily unavailable") ||
+          message.includes("too many requests") ||
+          message.includes("rate limit") ||
+          message.includes("overloaded");
+
+        // Do not retry unrelated errors.
+        if (!isTemporaryError) {
+          throw error;
+        }
+
+        lastTemporaryError = error;
+
+        if (attempt < maxRetries) {
+          // Exponential backoff: 2 seconds, then 4 seconds.
+          const waitTime =
+            2000 * Math.pow(2, attempt);
+
+          console.warn(
+            `Gemini model ${modelName} is temporarily unavailable. ` +
+              `Retrying in ${waitTime / 1000}s ` +
+              `(attempt ${attempt + 1}/${maxRetries}).`
+          );
+
+          await delay(waitTime);
+        } else {
+          console.warn(
+            `Retries exhausted for ${modelName}; trying the fallback model if configured.`
+          );
+        }
       }
-
-      // Retry temporary failures with a short delay.
-      const waitTime = 1500 * Math.pow(2, attempt);
-
-      console.warn(
-        `Gemini temporarily unavailable. Retrying in ${
-          waitTime / 1000
-        } seconds. Attempt ${attempt + 1}/${maxRetries}.`
-      );
-
-      await delay(waitTime);
     }
   }
 
-  throw new Error(
-    "Gemini AI could not complete the request. Please try again."
+  // Both models failed temporarily.
+  const finalError = new Error(
+    "Gemini AI is temporarily unavailable on the primary and fallback models. Please wait a little and try again."
   );
+
+  finalError.status =
+    Number(lastTemporaryError?.status) || 503;
+
+  finalError.code = "GEMINI_TEMPORARILY_UNAVAILABLE";
+
+  finalError.originalMessage =
+    lastTemporaryError?.message ||
+    "No additional error details";
+
+  throw finalError;
 };
 
 // =====================================================
@@ -286,11 +311,15 @@ export const analyzeJobDescription = async (
     typeof jobDescription !== "string" ||
     !jobDescription.trim()
   ) {
-    throw new Error("Please provide a valid job description.");
+    throw new Error(
+      "Please provide a valid job description."
+    );
   }
 
   if (!Array.isArray(userSkills)) {
-    throw new Error("userSkills must be an array.");
+    throw new Error(
+      "userSkills must be an array."
+    );
   }
 
   const prompt = `
